@@ -1,3 +1,5 @@
+from importlib.util import find_spec
+
 import pytest
 
 from ksef_mcp import keyring_preflight
@@ -112,9 +114,8 @@ def test_a_platform_without_secret_service_has_no_lock_state() -> None:
 
 
 def test_the_module_is_loaded_by_name_when_it_is_installed() -> None:
-    # Linux-only by dependency marker, and the suite runs on Linux; the absence
-    # path is the test above it.
-    assert REAL_LOAD_SECRET_SERVICE() is not None
+    # SecretService is a Linux-only dependency; absence is valid on macOS.
+    assert (REAL_LOAD_SECRET_SERVICE() is not None) == (find_spec("secretstorage") is not None)
 
 
 def test_an_uninstalled_secret_service_is_not_an_error(monkeypatch: pytest.MonkeyPatch) -> None:

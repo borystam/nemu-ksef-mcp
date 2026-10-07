@@ -250,6 +250,13 @@ def verification_code(
     )
 
 
+def spreadsheet_text(value: str) -> str:
+    """Keep counterparty-controlled text from becoming a spreadsheet formula."""
+    if value.startswith(("\t", "\r", "\n")) or value.lstrip().startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
 @dataclass(frozen=True)
 class StatementRow:
     invoice: InvoiceMetadata
@@ -259,10 +266,10 @@ class StatementRow:
     def cells(self) -> tuple[str, ...]:
         return (
             str(self.invoice.ksef_number),
-            self.invoice.seller_invoice_number,
+            spreadsheet_text(self.invoice.seller_invoice_number),
             self.invoice.issue_date.isoformat(),
             self.invoice.seller_nip,
-            "" if self.invoice.seller_name is None else self.invoice.seller_name,
+            spreadsheet_text("" if self.invoice.seller_name is None else self.invoice.seller_name),
             amount(self.invoice.gross_amount),
             amount(self.invoice.net_amount),
             amount(self.invoice.vat_amount),

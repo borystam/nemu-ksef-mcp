@@ -1,9 +1,9 @@
 """Incremental synchronisation: package exports, high water mark, one subject type at a time.
 
 The canonical pattern the Ministry publishes (D-031), not an invention of ours.
-Everything the caller might be tempted to tune — the window, the page size, how
-many packages to ask for — is decided here or by KSeF, never passed in from a
-tool (D-020).
+The window size, page size and number of packages are decided here or by KSeF.
+The caller may select the historical starting point of a new synchronisation;
+each subsequent pass remains bounded by the same windows and allowance.
 
 The pass runs the whole way: a package KSeF reports as ready is fetched,
 decrypted and written to the subject's archive inside the same call, and the
@@ -26,6 +26,7 @@ from typing import Final
 from ksef_mcp.allowance import Allowance, CeilingNotice
 from ksef_mcp.clock import now_utc
 from ksef_mcp.diagnostics import technical_log
+from ksef_mcp.errors import KsefMcpInputRejected
 from ksef_mcp.invoices.package import PackageRetriever, PackageUnreadable
 from ksef_mcp.ksef_port.budget import QueryBudget
 from ksef_mcp.ksef_port.errors import (
@@ -299,6 +300,11 @@ class Synchroniser:
     stays on disk with its key and its parts, so the next pass continues it
     instead of spending another export on the same window — and so does a
     package that was fetched but could not be archived.
+
+    `initial_from` selects a timezone-aware, nonfuture starting point only for
+    a new record. It seeds every role, including those waiting for the night
+    window. Once recorded, resume with `initial_from=None`: supplying a date
+    again is rejected, so this option cannot reset or rewind established work.
     """
 
     port: KsefPort
@@ -308,6 +314,7 @@ class Synchroniser:
     sleep: Callable[[float], None] = time.sleep
     poll_attempts: int = POLL_ATTEMPTS
     poll_interval: timedelta = POLL_INTERVAL
+    initial_from: datetime | None = None
 
     @property
     def archive(self) -> InvoiceArchive:
@@ -336,7 +343,7 @@ class Synchroniser:
             return self._advance_all(nip=nip, token=token)
 
     def _advance_all(self, *, nip: str, token: Credential) -> SynchronisationReport:
-        state = self.store.load()
+        state = self._initialise(self.store.load())
         reports: list[SubjectRoleReport] = []
         with self.port.session(nip=nip, token=token) as opened:
             session = self.allowance.guarded(session=opened)
@@ -371,6 +378,30 @@ class Synchroniser:
             state_path=str(self.store.path),
             ceilings=reading.ceilings,
         )
+
+    def _initialise(self, state: SyncState) -> SyncState:
+        if self.initial_from is None:
+            return state
+        if self.initial_from.utcoffset() is None:
+            raise KsefMcpInputRejected("initial_from must include a timezone offset.")
+        if self.initial_from > self.clock():
+            raise KsefMcpInputRejected("initial_from must not be in the future.")
+        if state.subject_roles or state.pending or state.settled:
+            raise KsefMcpInputRejected(
+                "Synchronisation already has saved state. Omit initial_from to resume; "
+                "the initial date cannot reset or rewind an existing record."
+            )
+        initialised = replace(
+            state,
+            subject_roles={
+                role: SubjectRoleState(reached=self.initial_from)
+                for role in SYNCHRONISED_SUBJECT_ROLES
+            },
+        )
+        # Persist even roles that cannot run yet. Otherwise a later process
+        # would silently start them at the default lookback instead.
+        self.store.save(initialised)
+        return initialised
 
     def _advance_one(
         self,
@@ -489,12 +520,13 @@ class Synchroniser:
             # to undo this one export, and it dies with it (GH-93).
             covering_from=opening.reached,
         )
-        # The attempt is recorded before the package is, so a run that dies
-        # while polling still holds the fifteen-minute floor open.
         advanced = state.with_pending(queued).with_subject_role(
             subject_role,
             SubjectRoleState(reached=opening.reached, attempted_at=moment),
         )
+        # KSeF has accepted the export. Save its reference, AES key and attempt
+        # together before polling can fail or the process can be interrupted.
+        self.store.save(advanced)
         return self._resume(
             budget=budget,
             retriever=retriever,

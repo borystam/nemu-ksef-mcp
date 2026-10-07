@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from ksef_mcp import cli
+from ksef_mcp.metadata import SERVER_NAME
 from ksef_mcp.setup import skill
 from tests.cli.conftest import Recorder
 
@@ -37,7 +38,7 @@ def test_skill_install_writes_into_the_chosen_scope(
 
     code = install_skill(recorder, scope=scope, tmp_path=tmp_path)
 
-    written = tmp_path / parent / ".claude" / "skills" / "ksef-mcp" / "SKILL.md"
+    written = tmp_path / parent / ".claude" / "skills" / SERVER_NAME / "SKILL.md"
     assert (code, written.is_file()) == (cli.EXIT_OK, True)
 
 

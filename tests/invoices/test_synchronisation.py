@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from ksef_mcp.allowance import LEDGER_FILE
+from ksef_mcp.errors import KsefMcpInputRejected
 from ksef_mcp.invoices.synchronisation import (
     ABANDONED_AFTER,
     INITIAL_LOOKBACK,
@@ -52,7 +53,7 @@ from ksef_mcp.ksef_port import (
     SessionCeilings,
     SubjectRole,
 )
-from ksef_mcp.ksef_port.types import MAX_QUERY_WINDOW
+from ksef_mcp.ksef_port.types import MAX_QUERY_WINDOW, SYNCHRONISED_SUBJECT_ROLES
 from ksef_mcp.storage.archive import INDEX_FILE, InvoiceArchive
 from ksef_mcp.storage.sync_store import (
     MINIMUM_INTERVAL,
@@ -293,6 +294,7 @@ def a_synchroniser(
     store: SyncStore,
     naps: list[float],
     moment: datetime = NOON,
+    initial_from: datetime | None = None,
 ) -> Synchroniser:
     return Synchroniser(
         port=ScriptedPort(session_double=session),
@@ -305,6 +307,7 @@ def a_synchroniser(
         ),
         clock=FrozenClock(moment=moment),
         sleep=naps.append,
+        initial_from=initial_from,
     )
 
 
@@ -521,6 +524,91 @@ def test_a_first_run_starts_one_lookback_back(
     first_pass: SynchronisationReport, session: ScriptedSession
 ) -> None:
     assert session.started[0][1].date_from == NOON - INITIAL_LOOKBACK
+
+
+def test_selected_history_survives_restart_for_every_role_and_uses_bounded_windows(
+    store: SyncStore, naps: list[float]
+) -> None:
+    initial_from = NOON - 3 * MAX_QUERY_WINDOW
+    session = ScriptedSession(statuses=[emptied()], limits=allowances())
+    a_synchroniser(session=session, store=store, naps=naps, initial_from=initial_from).run(
+        nip=NIP, token=TOKEN
+    )
+
+    saved = store.load()
+    assert set(saved.subject_roles) == set(SYNCHRONISED_SUBJECT_ROLES)
+    assert saved.subject_roles[SubjectRole.THIRD_SUBJECT].reached == initial_from
+    assert saved.subject_roles[SubjectRole.AUTHORIZED_SUBJECT].reached == initial_from
+    assert [role for role, _ in session.started] == [SubjectRole.SELLER, SubjectRole.BUYER]
+
+    reopened = SyncStore(nip=store.nip, environment=store.environment, root=store.root)
+    report = a_synchroniser(
+        session=session, store=reopened, naps=naps, moment=MIDNIGHT + timedelta(days=1)
+    ).run(nip=NIP, token=TOKEN)
+
+    assert [role for role, _ in session.started[2:]] == list(SYNCHRONISED_SUBJECT_ROLES)
+    assert {window.date_from for _, window in session.started[:2]} == {initial_from}
+    assert {window.date_from for _, window in session.started[2:4]} == {
+        initial_from + MAX_QUERY_WINDOW
+    }
+    assert {window.date_from for _, window in session.started[4:]} == {initial_from}
+    assert all(
+        window.date_to - window.date_from == MAX_QUERY_WINDOW for _, window in session.started
+    )
+    assert all(role.outcome is SyncOutcome.EMPTY_WINDOW for role in report.subject_roles)
+
+
+@pytest.mark.parametrize(
+    ("initial_from", "message"),
+    [
+        (NOON.replace(tzinfo=None), "timezone offset"),
+        (NOON + timedelta(seconds=1), "future"),
+    ],
+)
+def test_invalid_initial_date_is_rejected_before_an_export_or_state_change(
+    session: ScriptedSession,
+    store: SyncStore,
+    naps: list[float],
+    initial_from: datetime,
+    message: str,
+) -> None:
+    with pytest.raises(KsefMcpInputRejected, match=message):
+        a_synchroniser(session=session, store=store, naps=naps, initial_from=initial_from).run(
+            nip=NIP, token=TOKEN
+        )
+
+    assert session.started == []
+    assert not store.path.exists()
+
+
+@pytest.mark.parametrize("record", ["subject_roles", "pending", "settled"])
+def test_initial_date_cannot_reset_any_established_record(
+    session: ScriptedSession, store: SyncStore, naps: list[float], record: str
+) -> None:
+    queued = PendingExport.queued(
+        handle=ExportHandle(
+            reference="EXP-EXISTING",
+            encryption=ExportEncryption(key=KEY, initialisation_vector=IV),
+        ),
+        subject_role=SubjectRole.SELLER,
+        started_at=NOON,
+        covering_from=LAST_SEEN,
+    )
+    states = {
+        "subject_roles": SyncState(subject_roles={SubjectRole.SELLER: SubjectRoleState(HWM)}),
+        "pending": SyncState(pending=(queued,)),
+        "settled": SyncState(settled=(queued.refused(),)),
+    }
+    store.save(states[record])
+    original = store.path.read_bytes()
+
+    with pytest.raises(KsefMcpInputRejected, match="Omit initial_from to resume"):
+        a_synchroniser(
+            session=session, store=store, naps=naps, initial_from=NOON - 3 * MAX_QUERY_WINDOW
+        ).run(nip=NIP, token=TOKEN)
+
+    assert session.started == []
+    assert store.path.read_bytes() == original
 
 
 def test_a_completed_package_moves_the_point_to_the_high_water_mark(
@@ -933,6 +1021,49 @@ def test_an_attempt_already_made_is_held_when_a_later_type_blows_up(
     # restart. Losing it means the next pass asks again immediately, building
     # the retry pattern the Ministry records (D-031 §5).
     assert store.load().subject_roles[SubjectRole.SELLER].attempted_at == NOON
+
+
+@pytest.mark.parametrize("subject_role", SYNCHRONISED_SUBJECT_ROLES)
+@pytest.mark.parametrize("failure_type", [KsefUnreachable, MemoryError])
+def test_poll_failure_keeps_accepted_export_and_restart_resumes_it_exactly_once(
+    store: SyncStore,
+    naps: list[float],
+    subject_role: SubjectRole,
+    failure_type: type[Exception],
+) -> None:
+    reference = f"EXP-{SYNCHRONISED_SUBJECT_ROLES.index(subject_role) + 1}"
+    session = ScriptedSession(
+        statuses=[ready()],
+        limits=allowances(),
+        status_failures={reference: failure_type("Synthetic poll interruption")},
+    )
+    with pytest.raises(failure_type):
+        a_synchroniser(session=session, store=store, naps=naps, moment=MIDNIGHT).run(
+            nip=NIP, token=TOKEN
+        )
+
+    # Read from disk, then discard the synchroniser and store objects just as
+    # a new process does. The remote export has already spent its allowance.
+    reopened = SyncStore(nip=store.nip, environment=store.environment, root=store.root)
+    saved = reopened.load()
+    queued = saved.pending_for(subject_role)
+    assert queued is not None
+    assert queued.reference == reference
+    assert queued.encryption == ExportEncryption(key=KEY, initialisation_vector=IV)
+    assert queued.covering_from == MIDNIGHT - INITIAL_LOOKBACK
+    assert saved.subject_roles[subject_role] == SubjectRoleState(
+        reached=MIDNIGHT - INITIAL_LOOKBACK, attempted_at=MIDNIGHT
+    )
+
+    session.status_failures.clear()
+    resumed = a_synchroniser(session=session, store=reopened, naps=naps, moment=MIDNIGHT).run(
+        nip=NIP, token=TOKEN
+    )
+
+    assert outcome(resumed, subject_role) is SyncOutcome.ARCHIVED
+    assert session.polled.count(reference) == 2
+    assert [role for role, _ in session.started] == list(SYNCHRONISED_SUBJECT_ROLES)
+    assert reopened.load().pending == ()
 
 
 def test_a_ready_package_without_a_continuation_marker_does_not_move_the_point(

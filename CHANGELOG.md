@@ -1,3 +1,21 @@
+# Nemu KSeF MCP 0.1.0 — 2026-10-07
+
+Initial independently maintained AGPL fork of Dev10x-Guru/ksef-mcp.
+
+- Persist accepted exports before polling; add explicit initial historical start.
+- Expire metadata snapshots; preserve visible failures when refresh is blocked.
+- Verify and repair retained archive evidence with explicit retention records.
+- Bound sync previews, retain exact counts and expose local operational status.
+- Neutralize formula-leading CSV text and redact signed URLs from download errors.
+- Support environment-token onboarding on headless hosts; report registration errors.
+- Rename package/state identity, update PyJWT and add regression/installed-MCP checks.
+
+Synthetic-tested alpha; live KSeF account and Hermes deployment remain unverified.
+
+---
+
+The following is retained upstream release history, not Nemu version numbering.
+
 # Dziennik zmian
 
 Format wzorowany na [Keep a Changelog](https://keepachangelog.com/pl/1.1.0/);

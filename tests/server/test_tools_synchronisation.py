@@ -39,14 +39,13 @@ def synchronised(synchronising: None) -> SynchronisationResult:
 
 
 @pytest.mark.anyio
-async def test_synchronisation_takes_no_arguments_from_the_caller(
+async def test_synchronisation_only_exposes_optional_initial_history_start(
     listed_tools: ListToolsResult,
 ) -> None:
-    # D-020 is a hard criterion: an agent driving the window or the page size
-    # spends a twenty-per-hour allowance in two minutes.
     tool = next(tool for tool in listed_tools.tools if tool.name == "synchronise_invoices")
 
-    assert tool.input_schema.get("properties", {}) == {}
+    assert set(tool.input_schema["properties"]) == {"initial_from"}
+    assert not tool.input_schema.get("required")
 
 
 def test_synchronisation_refuses_before_onboarding(monkeypatch: pytest.MonkeyPatch) -> None:

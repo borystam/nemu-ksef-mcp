@@ -152,6 +152,7 @@ class AuditedOperation(StrEnum):
     REVIEW = "review_new_invoices"
     RENDER = "render_invoice_pdf"
     PURGE = "purge_archive"
+    STATUS = "synchronisation_status"
 
 
 @dataclass(frozen=True)

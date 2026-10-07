@@ -1,3 +1,4 @@
+import socket
 import threading
 from collections.abc import Callable, Iterator
 from datetime import datetime
@@ -10,6 +11,30 @@ from ksef_mcp.allowance import Allowance
 from ksef_mcp.clock import now_utc
 from ksef_mcp.diagnostics import LOG_FILE, configure_diagnostics, technical_log
 from ksef_mcp.ksef_port.types import KsefEnvironment
+
+
+@pytest.fixture(autouse=True)
+def no_network_in_default_tests(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missed SDK mock must not turn a unit test into a registry request."""
+    if request.node.get_closest_marker("ksef_live") is not None:
+        return
+    original_connect = socket.socket.connect
+    original_connect_ex = socket.socket.connect_ex
+
+    def connect(sock: socket.socket, address: object) -> None:
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            raise AssertionError("Network is disabled in default tests; use a synthetic port")
+        original_connect(sock, address)
+
+    def connect_ex(sock: socket.socket, address: object) -> int:
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            raise AssertionError("Network is disabled in default tests; use a synthetic port")
+        return original_connect_ex(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
 
 
 def raiser(error: Exception) -> Callable[..., object]:

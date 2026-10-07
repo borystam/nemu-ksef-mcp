@@ -7,9 +7,8 @@ reaches KSeF.
 The assertions come in three families. Placement — a subdirectory per subject,
 inside the data directory, readable only by its owner. Identity — the file is
 named after the KSeF number the manifest states, never after the entry name in
-the package. And repetition — a second run writes nothing, an invoice already
-on disk is never written over, and an archive whose bodies were deleted still
-refuses to fetch them again, because the index is a separate file (D-005).
+the package. And repetition — a second run verifies retained bytes, repairs
+damaged bodies, and preserves explicit retention decisions in the index (D-005).
 """
 
 import json
@@ -25,6 +24,9 @@ from ksef_mcp.durability import WriteExclusivityUnavailable, exclusive_write
 from ksef_mcp.ksef_port.types import ExportPackage, KsefEnvironment, PackageDocument
 from ksef_mcp.metadata import SERVER_NAME
 from ksef_mcp.storage.archive import (
+    ArchiveBodyState,
+    ArchiveEvidenceConflict,
+    ArchiveEvidenceUnavailable,
     ArchiveIndexUnreadable,
     ArchiveMetadataUnusable,
     ArchiveNotPerformed,
@@ -273,33 +275,47 @@ def test_the_index_does_not_grow_a_second_entry_for_the_same_invoice(
     assert len(archive.load_index().entries) == 2
 
 
-def test_an_invoice_already_on_disk_is_never_written_over(
+def test_corrupt_indexed_evidence_is_repaired_from_a_verified_export(
     archive: InvoiceArchive, package: ExportPackage, stored: ArchiveReport
 ) -> None:
     archived_path(archive, 1).write_bytes(b"<Faktura>tknieta recznie</Faktura>")
 
-    archive.store(package=package)
+    before = archive.load_index()
+    report = archive.store(package=package)
 
-    assert archived_path(archive, 1).read_bytes() == b"<Faktura>tknieta recznie</Faktura>"
+    assert archived_path(archive, 1).read_bytes() == a_body(1)
+    assert report.archived == (str(synthetic_number(1)),)
+    assert archive.load_index() == before
+    assert list(archive.directory.rglob("*.tmp")) == []
+    assert stat.S_IMODE(archived_path(archive, 1).stat().st_mode) == 0o600
 
 
-def test_a_deleted_body_is_not_fetched_back_because_the_index_remembers_it(
+def test_missing_retained_bodies_are_restored_from_a_verified_export(
     archive: InvoiceArchive, package: ExportPackage, stored: ArchiveReport
 ) -> None:
     archived_path(archive, 1).unlink()
     archived_path(archive, 2).unlink()
 
-    assert archive.store(package=package).archived == ()
+    assert archive.store(package=package).archived == (
+        str(synthetic_number(1)),
+        str(synthetic_number(2)),
+    )
+    assert archived_path(archive, 1).read_bytes() == a_body(1)
+    assert archived_path(archive, 2).read_bytes() == a_body(2)
 
 
-def test_retention_leaves_no_body_behind_when_the_index_alone_decides(
+def test_replaying_a_repaired_archive_is_idempotent(
     archive: InvoiceArchive, package: ExportPackage, stored: ArchiveReport
 ) -> None:
     archived_path(archive, 1).unlink()
 
     archive.store(package=package)
+    before = archived_path(archive, 1).stat().st_mtime_ns
+    report = archive.store(package=package)
 
-    assert archived_path(archive, 1).exists() is False
+    assert report.archived == ()
+    assert report.already_held == (str(synthetic_number(1)), str(synthetic_number(2)))
+    assert archived_path(archive, 1).stat().st_mtime_ns == before
 
 
 def test_a_body_without_an_index_entry_is_taken_as_held_rather_than_rewritten(
@@ -321,6 +337,87 @@ def test_a_body_without_an_index_entry_puts_that_number_back_in_the_index(
     archive.store(package=package)
 
     assert archive.load_index().known == {str(synthetic_number(1)), str(synthetic_number(2))}
+
+
+def test_corrupt_unindexed_evidence_is_repaired_before_its_digest_is_recorded(
+    archive: InvoiceArchive, package: ExportPackage, stored: ArchiveReport
+) -> None:
+    archive.index_path.unlink()
+    archived_path(archive, 1).write_bytes(b"incomplete local evidence")
+
+    report = archive.store(package=package)
+
+    assert report.archived == (str(synthetic_number(1)),)
+    assert report.already_held == (str(synthetic_number(2)),)
+    assert archived_path(archive, 1).read_bytes() == a_body(1)
+    for entry in archive.load_index().entries:
+        retained = archive.invoice_directory / f"{entry.ksef_number}.xml"
+        assert entry.content_hash == digest_of(retained.read_bytes())
+
+
+def test_an_identity_conflict_refuses_the_whole_package_before_writing(
+    archive: InvoiceArchive, stored: ArchiveReport
+) -> None:
+    conflicting = ExportPackage(
+        reference="EXP-CONFLICT",
+        documents=(
+            PackageDocument(name="new.xml", content=a_body(3)),
+            PackageDocument(name="changed.xml", content=b"different verified bytes"),
+        ),
+        metadata=a_manifest(
+            as_ksef_sends_it(3),
+            {
+                "ksefNumber": str(synthetic_number(1)),
+                "invoiceHash": base64_digest(b"different verified bytes"),
+            },
+        ),
+    )
+    before = archive.index_path.read_bytes()
+
+    with pytest.raises(ArchiveEvidenceConflict, match="recorded digest") as refused:
+        archive.store(package=conflicting)
+
+    assert_named_by_handle_only(str(refused.value), ordinals=(1,))
+    assert archived_path(archive, 1).read_bytes() == a_body(1)
+    assert not archived_path(archive, 3).exists()
+    assert archive.index_path.read_bytes() == before
+
+
+def make_legacy_index(archive: InvoiceArchive) -> None:
+    document = json.loads(archive.index_path.read_text(encoding="utf-8"))
+    document["schema_version"] = 1
+    for entry in document["entries"]:
+        del entry["body_state"]
+    archive.index_path.write_text(json.dumps(document), encoding="utf-8")
+
+
+def test_a_legacy_index_is_upgraded_only_after_verifying_retained_bodies(
+    archive: InvoiceArchive, package: ExportPackage, stored: ArchiveReport
+) -> None:
+    make_legacy_index(archive)
+    assert archive.load_index().entries[0].body_state is ArchiveBodyState.LEGACY
+
+    assert archive.store(package=package).archived == ()
+
+    assert all(
+        entry.body_state is ArchiveBodyState.RETAINED for entry in archive.load_index().entries
+    )
+    assert json.loads(archive.index_path.read_text(encoding="utf-8"))["schema_version"] == 2
+
+
+def test_ambiguous_legacy_missing_bodies_require_a_retention_decision(
+    archive: InvoiceArchive, package: ExportPackage, stored: ArchiveReport
+) -> None:
+    make_legacy_index(archive)
+    archived_path(archive, 1).unlink()
+    before = archive.index_path.read_bytes()
+
+    with pytest.raises(ArchiveEvidenceUnavailable, match="legacy") as refused:
+        archive.store(package=package)
+
+    assert_named_by_handle_only(str(refused.value), ordinals=(1,))
+    assert not archived_path(archive, 1).exists()
+    assert archive.index_path.read_bytes() == before
 
 
 def test_each_subject_gets_its_own_subdirectory(archive: InvoiceArchive, tmp_path: Path) -> None:
@@ -377,6 +474,21 @@ def test_an_index_from_a_newer_build_is_refused_rather_than_guessed_at(
     archive.index_path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(ArchiveIndexUnreadable, match="Nie zgaduję"):
+        archive.load_index()
+
+
+@pytest.mark.parametrize("body_state", [None, "unknown"])
+def test_invalid_retention_state_is_refused_rather_than_guessed(
+    archive: InvoiceArchive, stored: ArchiveReport, body_state: str | None
+) -> None:
+    document = json.loads(archive.index_path.read_text(encoding="utf-8"))
+    if body_state is None:
+        del document["entries"][0]["body_state"]
+    else:
+        document["entries"][0]["body_state"] = body_state
+    archive.index_path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ArchiveIndexUnreadable, match="invalid entry"):
         archive.load_index()
 
 
@@ -493,6 +605,46 @@ def test_two_numbers_pointing_at_one_document_are_refused(archive: InvoiceArchiv
 
     with pytest.raises(ArchiveMetadataUnusable, match="One document cannot be two"):
         archive.store(package=contested)
+
+
+def test_one_number_pointing_at_two_documents_is_refused_before_writing(
+    archive: InvoiceArchive,
+) -> None:
+    contested = ExportPackage(
+        reference="EXP-1",
+        documents=(
+            PackageDocument(name="first.xml", content=a_body(1)),
+            PackageDocument(name="second.xml", content=a_body(2)),
+        ),
+        metadata=a_manifest(
+            {"ksefNumber": str(synthetic_number(1)), "fileName": "first.xml"},
+            {"ksefNumber": str(synthetic_number(1)), "fileName": "second.xml"},
+        ),
+    )
+
+    with pytest.raises(ArchiveMetadataUnusable, match=r"names invoice.*twice") as refused:
+        archive.store(package=contested)
+
+    assert_named_by_handle_only(str(refused.value), ordinals=(1,))
+    assert not archive.invoice_directory.exists()
+
+
+def test_duplicate_package_document_names_are_refused_before_writing(
+    archive: InvoiceArchive,
+) -> None:
+    contested = ExportPackage(
+        reference="EXP-1",
+        documents=(
+            PackageDocument(name="same.xml", content=a_body(2)),
+            PackageDocument(name="same.xml", content=a_body(1)),
+        ),
+        metadata=a_manifest(as_ksef_sends_it(1)),
+    )
+
+    with pytest.raises(ArchiveMetadataUnusable, match="duplicate document names"):
+        archive.store(package=contested)
+
+    assert not archive.invoice_directory.exists()
 
 
 def test_the_digest_wins_when_a_manifest_states_both_and_they_disagree(

@@ -1,3 +1,4 @@
+import sys
 from subprocess import CompletedProcess, TimeoutExpired
 
 import pytest
@@ -40,13 +41,22 @@ def test_a_present_binary_is_reported_as_present(monkeypatch: pytest.MonkeyPatch
     assert client.command_available() is True
 
 
-def test_registration_asks_the_client_to_run_the_server_through_uvx(
+def test_registration_uses_the_installed_python_environment(
     recorded_arguments: list[list[str]],
 ) -> None:
     client.register(SERVER_NAME)
 
     assert recorded_arguments == [
-        [client.CLIENT_EXECUTABLE, "mcp", "add", SERVER_NAME, "--", "uvx", SERVER_NAME]
+        [
+            client.CLIENT_EXECUTABLE,
+            "mcp",
+            "add",
+            SERVER_NAME,
+            "--",
+            sys.executable,
+            "-c",
+            "from ksef_mcp.cli import main; raise SystemExit(main())",
+        ]
     ]
 
 

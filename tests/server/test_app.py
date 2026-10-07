@@ -39,13 +39,14 @@ async def test_every_tool_is_registered(listed_tools: ListToolsResult) -> None:
         "render_invoice_pdf",
         "review_new_invoices",
         "server_info",
+        "synchronisation_status",
         "synchronise_invoices",
     ]
 
 
 @pytest.fixture
 async def refused_synchronisation(monkeypatch: pytest.MonkeyPatch) -> CallToolResult:
-    def refuse(*, journal: Journal) -> SynchronisationResult:
+    def refuse(*, journal: Journal, initial_from: object = None) -> SynchronisationResult:
         raise KsefRefused("KSeF call failed: Invalid response payload")
 
     monkeypatch.setattr(tools_synchronisation, "synchronise", refuse)
@@ -63,7 +64,7 @@ async def unconfigured_listing(monkeypatch: pytest.MonkeyPatch) -> CallToolResul
 
 @pytest.fixture
 async def damaged_configuration(monkeypatch: pytest.MonkeyPatch) -> CallToolResult:
-    def refuse(*, journal: Journal) -> SynchronisationResult:
+    def refuse(*, journal: Journal, initial_from: object = None) -> SynchronisationResult:
         raise config.ConfigurationUnreadable(
             "/dane/configuration.json is not readable JSON — an interrupted "
             "write leaves the file truncated. Run `ksef-mcp onboarding` to "

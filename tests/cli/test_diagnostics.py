@@ -129,6 +129,36 @@ def test_doctor_reports_preflight(doctored: tuple[int, Recorder]) -> None:
     assert "Warunki wstępne:" in recorder.transcript
 
 
+def test_doctor_recognizes_an_environment_token_without_accessing_keyring(
+    healthy_node: None,
+    configured: Path,
+    working_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(token_store.FALLBACK_ENVIRONMENT_VARIABLE, TOKEN)
+    monkeypatch.setattr(
+        keyring_preflight, "inspect_keyring", raiser(AssertionError("keyring probe"))
+    )
+    monkeypatch.setattr(
+        keyring_preflight, "inspect_collection_lock", raiser(AssertionError("keyring lock probe"))
+    )
+    monkeypatch.setattr(ksef_port, "check_connection", raiser(AssertionError("KSeF request")))
+    recorder = Recorder()
+
+    code = cli.main(
+        ["doctor"],
+        console=recorder.console,
+        working_directory=working_directory,
+        configuration_file=configured,
+    )
+
+    assert code == cli.EXIT_OK
+    assert "KSEF_TOKEN is present" in recorder.transcript
+    assert "are not verified" in recorder.transcript
+    assert TOKEN not in recorder.transcript
+    assert TOKEN[-token_store.SUFFIX_LENGTH :] not in recorder.transcript
+
+
 def test_doctor_names_the_path_it_runs_from(doctored: tuple[int, Recorder]) -> None:
     # With two distributions shipping a `ksef-mcp` script, the path is the
     # only answer that says which one won on PATH (#75).

@@ -15,6 +15,7 @@ from ksef_mcp.server.tools_listing import list_recent_invoices
 from ksef_mcp.server.tools_rendering import render_invoice_pdf
 from ksef_mcp.server.tools_review import review_new_invoices
 from ksef_mcp.server.tools_statement import export_period_statement
+from ksef_mcp.server.tools_status import synchronisation_status
 from ksef_mcp.server.tools_synchronisation import synchronise_invoices
 
 __all__ = [
@@ -26,5 +27,6 @@ __all__ = [
     "review_new_invoices",
     "server",
     "server_info",
+    "synchronisation_status",
     "synchronise_invoices",
 ]

@@ -9,7 +9,7 @@ spends zero of the twenty metadata queries an hour (D-021).
 
 import json
 import stat
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -28,11 +28,12 @@ from ksef_mcp.ksef_port import (
     RateLimits,
     SubjectRole,
 )
-from ksef_mcp.ksef_port.errors import BudgetExhausted, KsefUnreachable
+from ksef_mcp.ksef_port.errors import BudgetExhausted, KsefRateLimited, KsefUnreachable
 from ksef_mcp.ksef_port.types import Operation
 from ksef_mcp.metadata import SERVER_NAME
 from ksef_mcp.storage import period_cache as period_cache_module
 from ksef_mcp.storage.period_cache import (
+    DEFAULT_MAX_AGE,
     SCHEMA_VERSION,
     CachedPeriod,
     PeriodCache,
@@ -95,9 +96,8 @@ class CountingSession:
 
 @pytest.fixture
 def page() -> MetadataPage:
-    # Complete, because since GH-182 only a complete window is written to disk:
-    # nothing in this root expires, so remembering a stump would make it the
-    # answer forever.
+    # Only complete windows can be reused; partial answers must be retried as
+    # soon as the allowance permits, without waiting for the cache to expire.
     return MetadataPage(
         invoices=(synthetic_metadata(1), synthetic_metadata(2, seller_name=None)),
         has_more=False,
@@ -266,9 +266,77 @@ def test_the_entry_outlives_the_object_that_wrote_it(
     cache: PeriodCache, page: MetadataPage, tmp_path: Path
 ) -> None:
     cache.remember(period=SEPTEMBER, subject_role=SubjectRole.BUYER, page=page)
-    restarted = PeriodCache(nip=NIP, environment=KsefEnvironment.TEST, root=tmp_path)
+    restarted = PeriodCache(
+        nip=NIP,
+        environment=KsefEnvironment.TEST,
+        root=tmp_path,
+        clock=lambda: ASKED_AT + timedelta(minutes=1),
+    )
 
     assert restarted.remembered(period=SEPTEMBER, subject_role=SubjectRole.BUYER) is not None
+
+
+@pytest.mark.parametrize(
+    ("age", "fresh"),
+    [
+        (timedelta(microseconds=-1), False),
+        (timedelta(0), True),
+        (timedelta(minutes=15) - timedelta(microseconds=1), True),
+        (timedelta(minutes=15), False),
+        (timedelta(minutes=16), False),
+    ],
+)
+def test_only_entries_younger_than_fifteen_minutes_are_reused(
+    cache: PeriodCache, page: MetadataPage, age: timedelta, fresh: bool
+) -> None:
+    cache.remember(period=SEPTEMBER, subject_role=SubjectRole.BUYER, page=page)
+    later = replace(cache, clock=lambda: ASKED_AT + age)
+
+    kept = later.remembered(period=SEPTEMBER, subject_role=SubjectRole.BUYER)
+
+    assert (kept is not None) is fresh
+    if kept is not None:
+        assert kept.queried_at == ASKED_AT
+
+
+def test_the_maximum_age_can_be_shortened(cache: PeriodCache, page: MetadataPage) -> None:
+    cache.remember(period=SEPTEMBER, subject_role=SubjectRole.BUYER, page=page)
+    shorter = replace(
+        cache,
+        max_age=timedelta(minutes=2),
+        clock=lambda: ASKED_AT + timedelta(minutes=2),
+    )
+
+    assert shorter.remembered(period=SEPTEMBER, subject_role=SubjectRole.BUYER) is None
+
+
+def test_a_negative_maximum_age_is_rejected(cache: PeriodCache) -> None:
+    with pytest.raises(ValueError, match="maximum age must not be negative"):
+        replace(cache, max_age=timedelta(seconds=-1))
+
+
+def test_a_zero_maximum_age_disables_reuse(
+    cache: PeriodCache, session: CountingSession, budget: QueryBudget
+) -> None:
+    reader = PeriodMetadataReader(cache=replace(cache, max_age=timedelta(0)), budget=budget)
+
+    first = reader.read(session=session, period=SEPTEMBER, subject_role=SubjectRole.BUYER)
+    second = reader.read(session=session, period=SEPTEMBER, subject_role=SubjectRole.BUYER)
+
+    assert not first.from_cache and not second.from_cache
+    assert len(session.asked) == 2
+    assert budget.remaining(Operation.METADATA_QUERY) == 18
+
+
+def test_a_timestamp_without_a_timezone_cannot_establish_freshness(
+    cache: PeriodCache, page: MetadataPage, entry_path: Path
+) -> None:
+    cache.remember(period=SEPTEMBER, subject_role=SubjectRole.BUYER, page=page)
+    document = json.loads(entry_path.read_text(encoding="utf-8"))
+    document["queried_at"] = ASKED_AT.replace(tzinfo=None).isoformat()
+    _corrupt(entry_path, document)
+
+    assert cache.remembered(period=SEPTEMBER, subject_role=SubjectRole.BUYER) is None
 
 
 def test_the_seller_type_does_not_answer_the_buyer_question(
@@ -574,6 +642,75 @@ def test_the_answer_carries_the_moment_the_period_was_last_paid_for(
     assert first.queried_at == ASKED_AT
 
 
+@pytest.mark.parametrize("initially_empty", [False, True])
+def test_a_late_invoice_is_found_after_expiry_even_for_a_finished_month(
+    cache: PeriodCache,
+    page: MetadataPage,
+    session: CountingSession,
+    budget: QueryBudget,
+    initially_empty: bool,
+) -> None:
+    """A persisted complete September answer must not hide an October arrival."""
+    first_query = datetime(2026, 10, 1, tzinfo=UTC)
+    initial = replace(page, invoices=() if initially_empty else page.invoices)
+    session.page = initial
+    first_cache = replace(cache, clock=lambda: first_query)
+    PeriodMetadataReader(cache=first_cache, budget=budget).read(
+        session=session, period=SEPTEMBER, subject_role=SubjectRole.BUYER
+    )
+
+    late_invoice = synthetic_metadata(3)
+    session.page = replace(initial, invoices=(*initial.invoices, late_invoice))
+    before_expiry = replace(cache, clock=lambda: first_query + timedelta(minutes=14))
+    recent = PeriodMetadataReader(cache=before_expiry, budget=budget).read(
+        session=session, period=SEPTEMBER, subject_role=SubjectRole.BUYER
+    )
+    assert recent.from_cache is True
+    assert recent.queried_at == first_query
+    assert recent.page == initial
+    assert len(session.asked) == 1
+
+    # A new cache and reader share only the real files with the previous run.
+    refreshed_at = first_query + DEFAULT_MAX_AGE
+    restarted = replace(cache, clock=lambda: refreshed_at)
+    reader = PeriodMetadataReader(cache=restarted, budget=budget)
+    refreshed = reader.read(session=session, period=SEPTEMBER, subject_role=SubjectRole.BUYER)
+    repeated = reader.read(session=session, period=SEPTEMBER, subject_role=SubjectRole.BUYER)
+
+    assert refreshed.page.invoices == (*initial.invoices, late_invoice)
+    assert refreshed.page.complete is True
+    assert refreshed.from_cache is False
+    assert refreshed.queried_at == refreshed_at
+    assert repeated.page == refreshed.page
+    assert repeated.from_cache is True
+    assert repeated.queried_at == refreshed_at
+    assert len(session.asked) == 2
+    assert budget.remaining(Operation.METADATA_QUERY) == 18
+
+
+def test_explicit_refresh_finds_a_late_invoice_before_expiry(
+    cache: PeriodCache, session: CountingSession, budget: QueryBudget
+) -> None:
+    reader = PeriodMetadataReader(cache=cache, budget=budget)
+    reader.read(session=session, period=SEPTEMBER, subject_role=SubjectRole.BUYER)
+    session.page = replace(session.page, invoices=(*session.page.invoices, synthetic_metadata(3)))
+    refreshed_at = ASKED_AT + timedelta(minutes=1)
+    later = replace(reader, cache=replace(cache, clock=lambda: refreshed_at))
+
+    refreshed = later.read(
+        session=session, period=SEPTEMBER, subject_role=SubjectRole.BUYER, refresh=True
+    )
+    repeated = later.read(session=session, period=SEPTEMBER, subject_role=SubjectRole.BUYER)
+
+    assert refreshed.page == session.page
+    assert refreshed.from_cache is False
+    assert refreshed.queried_at == refreshed_at
+    assert repeated.page == session.page
+    assert repeated.from_cache is True
+    assert repeated.queried_at == refreshed_at
+    assert len(session.asked) == 2
+
+
 def test_the_same_period_for_another_subject_role_is_paid_for_separately(
     reader: PeriodMetadataReader, session: CountingSession
 ) -> None:
@@ -610,7 +747,7 @@ def test_a_spent_allowance_refuses_the_first_question(
         starved.read(session=session, period=SEPTEMBER, subject_role=SubjectRole.BUYER)
 
 
-def test_a_spent_allowance_still_answers_a_period_already_on_disk(
+def test_a_spent_allowance_still_answers_a_recent_period_already_on_disk(
     cache: PeriodCache, session: CountingSession, page: MetadataPage
 ) -> None:
     cache.remember(period=SEPTEMBER, subject_role=SubjectRole.BUYER, page=page)
@@ -628,6 +765,63 @@ def test_a_spent_allowance_still_answers_a_period_already_on_disk(
     assert (
         starved.read(session=session, period=SEPTEMBER, subject_role=SubjectRole.BUYER).page == page
     )
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+def test_a_blocked_refresh_never_returns_the_old_complete_page(
+    cache: PeriodCache, session: CountingSession, page: MetadataPage, refresh: bool
+) -> None:
+    cache.remember(period=SEPTEMBER, subject_role=SubjectRole.BUYER, page=page)
+    age = timedelta(minutes=1) if refresh else DEFAULT_MAX_AGE
+    later = replace(cache, clock=lambda: ASKED_AT + age)
+    spent = QueryBudget(
+        limits=RateLimits(
+            metadata_queries=OperationLimit(per_second=None, per_minute=None, per_hour=0),
+            exports=GENEROUS,
+            export_statuses=GENEROUS,
+            invoice_downloads=GENEROUS,
+        ),
+        clock=later.clock,
+    )
+    reader = PeriodMetadataReader(cache=later, budget=spent)
+    entry_path = cache.path_for(period=SEPTEMBER, subject_role=SubjectRole.BUYER)
+    original = entry_path.read_bytes()
+
+    with pytest.raises(BudgetExhausted):
+        reader.read(
+            session=session, period=SEPTEMBER, subject_role=SubjectRole.BUYER, refresh=refresh
+        )
+
+    assert session.asked == []
+    assert entry_path.read_bytes() == original
+
+
+def test_a_registry_rate_limit_during_refresh_is_reported_without_a_stale_fallback(
+    cache: PeriodCache,
+    session: CountingSession,
+    page: MetadataPage,
+    budget: QueryBudget,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache.remember(period=SEPTEMBER, subject_role=SubjectRole.BUYER, page=page)
+    later = replace(cache, clock=lambda: ASKED_AT + DEFAULT_MAX_AGE)
+    entry_path = cache.path_for(period=SEPTEMBER, subject_role=SubjectRole.BUYER)
+    original = entry_path.read_bytes()
+
+    def rate_limited(**keywords: object) -> MetadataPage:
+        raise KsefRateLimited("Synthetic registry rate limit", retry_after=60)
+
+    monkeypatch.setattr(session, "query_metadata", rate_limited)
+
+    with pytest.raises(KsefRateLimited) as raised:
+        PeriodMetadataReader(cache=later, budget=budget).read(
+            session=session, period=SEPTEMBER, subject_role=SubjectRole.BUYER
+        )
+
+    assert raised.value.retry_after == 60
+    assert budget.remaining(Operation.METADATA_QUERY) == 19
+    assert entry_path.read_bytes() == original
+    assert later.remembered(period=SEPTEMBER, subject_role=SubjectRole.BUYER) is None
 
 
 def test_deleting_the_cache_root_costs_one_query_and_no_continuation_point(

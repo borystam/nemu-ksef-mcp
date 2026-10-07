@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -20,7 +22,7 @@ from ksef_mcp.cli.skills import run_skill_install
 from ksef_mcp.cli.tokens import explain_token_step
 from ksef_mcp.config import Configuration
 from ksef_mcp.ksef_port.types import KsefEnvironment
-from ksef_mcp.metadata import SERVER_NAME, VERSION
+from ksef_mcp.metadata import SERVER_COMMAND, SERVER_NAME, VERSION
 from ksef_mcp.paths import Nip, NipRejected
 from ksef_mcp.setup import client
 from ksef_mcp.setup.skill import SkillScope
@@ -168,7 +170,7 @@ def summarize_configuration(
 
 
 def registration_command() -> str:
-    return f"claude mcp add {SERVER_NAME} -- uvx {SERVER_NAME}"
+    return shlex.join(["claude", "mcp", "add", SERVER_NAME, "--", *SERVER_COMMAND])
 
 
 def offer_client_registration(console: Console) -> None:
@@ -191,8 +193,10 @@ def offer_client_registration(console: Console) -> None:
     if client.already_registered(SERVER_NAME):
         console.write(f"  Serwer {SERVER_NAME} jest już zarejestrowany — nic nie zmieniam.")
         return
-    client.register(SERVER_NAME)
-    console.write(f"  Zarejestrowany jako {SERVER_NAME}.")
+    if client.register(SERVER_NAME):
+        console.write(f"  Zarejestrowany jako {SERVER_NAME}.")
+    else:
+        console.write("  Client registration failed. Register manually: " + registration_command())
 
 
 def offer_skill_install(console: Console, *, home: Path, working_directory: Path) -> None:
@@ -240,23 +244,27 @@ def run_onboarding(
 ) -> int:
     console.write(f"{SERVER_NAME} {VERSION} — konfiguracja przed pierwszym uruchomieniem")
     console.write("")
+    environment_token = bool(os.environ.get(token_store.FALLBACK_ENVIRONMENT_VARIABLE))
     keyring_report = report_preflight(console, working_directory=working_directory)
-    if not keyring_report.usable:
+    if not environment_token and not keyring_report.usable:
         console.write("")
         console.write("Bez magazynu nie zapiszę tokenu i nie zapytam o hasło —")
         console.write("interaktywny prompt zawiesiłby transport MCP. Przerywam.")
         return EXIT_UNUSABLE_KEYRING
     console.write("")
     nip = str(ask_nip(console))
-    backend = choose_keyring_backend(console, keyring_report)
-    environment = choose_environment(console)
-    explain_token_step(console)
-    token = ask_secret_required(console, prompt="Wklej token KSeF (bez echa)")
-    stored = token_store.store_token(nip=nip, token=token)
-    console.write(
-        f"  Token zapisany i odczytany z powrotem: {stored.length} znaków, "
-        f"końcówka …{stored.suffix}"
+    backend = (
+        "environment" if environment_token else choose_keyring_backend(console, keyring_report)
     )
+    environment = choose_environment(console)
+    if not environment_token:
+        explain_token_step(console)
+        token = ask_secret_required(console, prompt="Wklej token KSeF (bez echa)")
+        stored = token_store.store_token(nip=nip, token=token)
+        console.write(
+            f"  Token zapisany i odczytany z powrotem: {stored.length} znaków, "
+            f"końcówka …{stored.suffix}"
+        )
     chosen = choose_working_directory(console, nip=nip)
     report_archive_location(console, nip=nip, environment=environment)
     configuration = Configuration(

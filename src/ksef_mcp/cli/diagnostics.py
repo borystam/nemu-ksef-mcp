@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -33,6 +34,10 @@ def report_preflight(
     node = node_preflight.inspect_node(working_directory=working_directory)
     for line in messages.describe_node(node):
         console.write(line)
+    if os.environ.get(token_store.FALLBACK_ENVIRONMENT_VARIABLE):
+        console.write("  KSEF_TOKEN is present in the environment; no keyring access is needed.")
+        console.write("  KSeF access and the token's taxpayer/environment are not verified.")
+        return keyring_preflight.KeyringReport(backends=(), preferred=None)
     keyring_report = keyring_preflight.inspect_keyring()
     for line in messages.describe_keyring(keyring_report):
         console.write(line)

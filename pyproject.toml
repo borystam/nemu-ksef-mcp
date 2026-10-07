@@ -3,17 +3,17 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "ksef-mcp"
-version = "0.4.2.dev0"
-description = "Local MCP server for KSeF, Poland's national e-invoicing system"
+name = "nemu-ksef-mcp"
+version = "0.1.0"
+description = "Read-only KSeF MCP with durable recovery, verified archives and bounded agent results"
 readme = "README.md"
 requires-python = "==3.13.14"
 license = "AGPL-3.0-only"
 # The vendored MIT-licensed artifact ships in the wheel (ADR-112), so its
 # notice must ship in `.dist-info/licenses/` too — the project's own LICENSE
 # alone does not cover it.
-license-files = ["LICENSE", "src/ksef_mcp/rendering/vendor/LICENCJA-MF.md"]
-authors = [{ name = "Dev10x.Guru" }]
+license-files = ["LICENSE", "NOTICE.md", "src/ksef_mcp/rendering/vendor/LICENCJA-MF.md"]
+authors = [{ name = "Dev10x.Guru" }, { name = "Borys Tam" }]
 keywords = ["ksef", "mcp", "e-invoicing", "faktury", "poland"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -38,10 +38,11 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Dev10x-Guru/ksef-mcp"
-Issues = "https://github.com/Dev10x-Guru/ksef-mcp/issues"
+Homepage = "https://github.com/borystam/nemu-ksef-mcp"
+Issues = "https://github.com/borystam/nemu-ksef-mcp/issues"
 
 [project.scripts]
+nemu-ksef-mcp = "ksef_mcp.cli:main"
 ksef-mcp = "ksef_mcp.cli:main"
 
 # Hatchling selects files by asking the VCS what is ignored, so until this

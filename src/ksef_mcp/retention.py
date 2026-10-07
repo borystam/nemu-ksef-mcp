@@ -12,8 +12,8 @@ What makes deleting safe is that the deduplication index is a separate file from
 the invoices it describes (D-005). An `IndexEntry` outlives the body it was
 written for, so after a purge the next synchronisation recognises those KSeF
 numbers as already held and does not spend the twenty-exports-an-hour allowance
-fetching them again. Nothing here writes to `deduplication.json`, and that
-omission is the whole design: the index is the memory, the bodies are the cost.
+fetching them again. The index records an explicit removal decision before
+deletion, so accidental loss can be repaired without undoing retention.
 
 Three other files live beside the archive and none of them is touched either.
 `synchronisation.json` records how far KSeF has been *asked*; resetting it would
@@ -211,12 +211,10 @@ class ArchivePurge:
         )
 
     def remove(self, *, plan: PurgePlan) -> PurgeReport:
-        """Unlink every planned body. The index is read afterwards, never written."""
-        for candidate in plan.candidates:
-            candidate.path.unlink()
-        # Read back rather than assumed: the sentence the operator is owed is
-        # "the index still remembers these numbers", and only the file can say it.
-        known = self.archive.load_index().known
+        """Record retention decisions and delete bodies under the archive lock."""
+        known = self.archive.remove_bodies(
+            numbers=(candidate.ksef_number for candidate in plan.candidates)
+        ).known
         return PurgeReport(
             directory=plan.directory,
             index_path=plan.index_path,

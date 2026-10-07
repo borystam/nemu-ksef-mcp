@@ -1,6 +1,7 @@
 import inspect
 import logging
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import reduce
@@ -932,12 +933,27 @@ def test_storage_refusing_for_another_reason_stays_an_ordinary_refusal(
     assert isinstance(refusal.value, PackageLinkExpired) is False
 
 
-def test_storage_that_cannot_be_reached_says_so(session: KsefSession) -> None:
+@pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.ReadTimeout])
+def test_storage_failure_reports_its_type_without_exposing_the_presigned_url(
+    session: KsefSession, failure: type[httpx.HTTPError], caplog: pytest.LogCaptureFixture
+) -> None:
+    secret = "synthetic-secret-signature"
+    part = replace(PART, url=f"https://storage.example/part/1?signature={secret}")
+
     def refuse(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("brak sieci")
+        raise failure(f"Request failed for {request.url}")
 
     session.transport = answering(refuse)
     handle = session.start_export(period=WINDOW, subject_role=SubjectRole.BUYER)
 
-    with pytest.raises(KsefUnreachable):
-        session.fetch_part(handle=handle, part=PART)
+    with (
+        caplog.at_level(logging.INFO, logger=LOGGER_NAME),
+        pytest.raises(KsefUnreachable) as raised,
+    ):
+        session.fetch_part(handle=handle, part=part)
+
+    # This message is forwarded to the model by the server's error wrapper.
+    assert str(raised.value) == f"Could not reach package storage: {failure.__name__}"
+    assert secret not in str(raised.value)
+    assert part.url not in str(raised.value)
+    assert secret not in caplog.text

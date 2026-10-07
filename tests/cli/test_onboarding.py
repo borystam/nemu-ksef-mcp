@@ -12,6 +12,7 @@ from ksef_mcp.setup import client
 from ksef_mcp.storage import token_store
 from ksef_mcp.storage.archive import InvoiceArchive
 from tests.cli.conftest import NIP, TOKEN, Recorder, keyring_report
+from tests.conftest import raiser
 from tests.invoices.test_statement import RecordingPort, RecordingSession, page_of
 from tests.support.synthetic import BUYER_NAME
 
@@ -225,11 +226,18 @@ def test_onboarding_says_the_archive_is_the_directory_to_back_up() -> None:
     assert "kopią zapasową" in recorder.transcript
 
 
+@pytest.mark.parametrize("exported_token", [None, ""])
 def test_onboarding_stops_when_no_keyring_is_available(
     healthy_node: None,
     unusable_keyring: keyring_preflight.KeyringReport,
     configuration_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exported_token: str | None,
 ) -> None:
+    if exported_token is None:
+        monkeypatch.delenv(token_store.FALLBACK_ENVIRONMENT_VARIABLE, raising=False)
+    else:
+        monkeypatch.setenv(token_store.FALLBACK_ENVIRONMENT_VARIABLE, exported_token)
     recorder = Recorder()
 
     code = cli.main(
@@ -257,6 +265,60 @@ def test_onboarding_never_prompts_without_a_keyring(
     )
 
     assert recorder.prompts == []
+
+
+@pytest.mark.parametrize("keyring_usable", [False, True])
+@pytest.mark.parametrize("verify_answer", ["", "t"])
+def test_onboarding_uses_the_environment_token_without_prompting_or_storing_it(
+    healthy_node: None,
+    configuration_file: Path,
+    working_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    keyring_usable: bool,
+    verify_answer: str,
+) -> None:
+    report = (
+        keyring_report(("keyring.backends.SecretService", 5))
+        if keyring_usable
+        else keyring_report()
+    )
+    monkeypatch.setattr(keyring_preflight, "inspect_keyring", lambda: report)
+    monkeypatch.setenv(token_store.FALLBACK_ENVIRONMENT_VARIABLE, TOKEN)
+    monkeypatch.setattr(token_store, "store_token", raiser(AssertionError("keyring write")))
+    monkeypatch.setattr(token_store, "read_from_keyring", raiser(AssertionError("keyring read")))
+    monkeypatch.setattr(
+        keyring_preflight, "inspect_collection_lock", raiser(AssertionError("keyring lock probe"))
+    )
+    session = RecordingSession(page=page_of(1))
+    monkeypatch.setattr(
+        port_adapter,
+        "Ksef2Port",
+        lambda *, environment: RecordingPort(session_object=session, environment=environment),
+    )
+    recorder = Recorder(answers=[NIP, "", str(working_directory), "n", "n", verify_answer])
+
+    code = cli.main(
+        ["onboarding"],
+        console=recorder.console,
+        working_directory=configuration_file.parent,
+        configuration_file=configuration_file,
+        home=configuration_file.parent,
+    )
+
+    assert code == cli.EXIT_OK
+    assert config.load_configuration(path=configuration_file) == config.Configuration(
+        nip=NIP,
+        environment=KsefEnvironment.TEST,
+        keyring_backend="environment",
+        working_directory=working_directory,
+    )
+    assert "KSEF_TOKEN is present" in recorder.transcript
+    assert "are not verified" in recorder.transcript
+    assert TOKEN not in recorder.transcript
+    assert TOKEN[-token_store.SUFFIX_LENGTH :] not in recorder.transcript
+    assert TOKEN not in configuration_file.read_text()
+    assert not any("Wklej token" in prompt for prompt in recorder.prompts)
+    assert session.asked == ([ksef_port.SubjectRole.BUYER] if verify_answer else [])
 
 
 @pytest.fixture
@@ -347,6 +409,20 @@ def test_registration_happens_when_the_client_is_there(
     assert registering_client == [SERVER_NAME]
 
 
+def test_failed_registration_reports_failure_and_leaves_the_manual_command(
+    onboarding_with: Callable[[list[str]], Recorder],
+    registering_client: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client, "register", lambda name: False)
+
+    recorder = onboarding_with(["t", "n", ""])
+
+    assert "Client registration failed" in recorder.transcript
+    assert onboarding.registration_command() in recorder.transcript
+    assert "Zarejestrowany jako" not in recorder.transcript
+
+
 def test_registration_is_not_repeated(
     onboarding_with: Callable[[list[str]], Recorder],
     client_already_holding_the_server: None,
@@ -373,7 +449,9 @@ def test_a_missing_client_names_the_command_verbatim(
 ) -> None:
     recorder = onboarding_with(["t", "n", ""])
 
-    assert f"claude mcp add {SERVER_NAME} -- uvx {SERVER_NAME}" in recorder.transcript
+    assert f"claude mcp add {SERVER_NAME} --" in recorder.transcript
+    assert "from ksef_mcp.cli import main" in recorder.transcript
+    assert "uvx" not in recorder.transcript
 
 
 def test_declined_skill_install_names_the_command(

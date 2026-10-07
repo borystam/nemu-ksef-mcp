@@ -46,10 +46,18 @@ ASSUMED_CEILINGS = replace(GRANTED_CEILINGS, assumed=True)
 class StubSynchroniser:
     """Stands in for the pass itself: this package's job is the tool surface."""
 
-    def __init__(self, *, port: object, store: object, allowance: object) -> None:
+    def __init__(
+        self,
+        *,
+        port: object,
+        store: object,
+        allowance: object,
+        initial_from: datetime | None = None,
+    ) -> None:
         self.port = port
         self.store = store
         self.allowance = allowance
+        self.initial_from = initial_from
 
     def run(self, *, nip: str, token: str) -> SynchronisationReport:
         return SynchronisationReport(

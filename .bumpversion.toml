@@ -1,5 +1,5 @@
 [tool.bumpversion]
-current_version = "0.4.2.dev0"
+current_version = "0.1.0"
 allow_dirty = false
 
 # `main` carries `X.Y.Z.dev0` between releases so a wheel built from it is
@@ -36,7 +36,7 @@ replace = 'version = "{new_version}"'
 # name so the replacement cannot wander into a dependency's version.
 [[tool.bumpversion.files]]
 filename = "uv.lock"
-search = '''name = "ksef-mcp"
+search = '''name = "nemu-ksef-mcp"
 version = "{current_version}"'''
-replace = '''name = "ksef-mcp"
+replace = '''name = "nemu-ksef-mcp"
 version = "{new_version}"'''

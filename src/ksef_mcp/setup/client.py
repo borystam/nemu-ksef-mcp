@@ -11,6 +11,8 @@ import shutil
 import subprocess
 from typing import Final
 
+from ksef_mcp.metadata import SERVER_COMMAND
+
 # Long enough for a cold CLI start, short enough that a hung binary does not
 # strand somebody halfway through onboarding.
 CLIENT_TIMEOUT_SECONDS: Final[float] = 20.0
@@ -47,5 +49,7 @@ def already_registered(name: str) -> bool:
 
 
 def register(name: str) -> bool:
-    completed = _run(["mcp", "add", name, "--", "uvx", name])
+    # Use the installed environment, not an unrelated package with the same
+    # executable name on PyPI. GitHub installs work before a PyPI release.
+    completed = _run(["mcp", "add", name, "--", *SERVER_COMMAND])
     return completed is not None and completed.returncode == 0

@@ -37,6 +37,7 @@ import json
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
@@ -59,7 +60,7 @@ INDEX_FILE: Final[str] = "deduplication.json"
 
 INVOICE_SUFFIX: Final[str] = ".xml"
 
-SCHEMA_VERSION: Final[int] = 1
+SCHEMA_VERSION: Final[int] = 2
 
 ARCHIVE_DIRECTORY_MODE: Final[int] = 0o700
 
@@ -117,12 +118,25 @@ class ArchiveNotPerformed(KsefMcpError):
     """Asked what an archivist stored before it stored anything."""
 
 
+class ArchiveEvidenceConflict(KsefMcpError):
+    """An incoming invoice disagrees with the identity already recorded."""
+
+
+class ArchiveEvidenceUnavailable(KsefMcpError):
+    """The archive lacks evidence needed to verify or remove an invoice body."""
+
+
+class ArchiveBodyState(StrEnum):
+    RETAINED = "retained"
+    REMOVED = "removed"
+    LEGACY = "legacy"
+
+
 class IndexEntryAlreadyHeld(KsefMcpError):
     """A KSeF number was offered to the index twice.
 
-    The invoice file has always refused its own duplicate structurally — the
-    name is the identity, and `_written` reports an existing target as already
-    held rather than replacing it. The index entry had no such guard: it was
+    The invoice name is its identity, and `_written` reports a verified target
+    as already held rather than replacing it. The index entry had no such guard: it was
     checked for uniqueness and never made to keep it, so two passes starting
     from one snapshot silently dropped the earlier pass's entries (GH-103).
     """
@@ -155,6 +169,7 @@ class IndexEntry:
     ksef_number: str
     content_hash: str
     archived_at: datetime
+    body_state: ArchiveBodyState = ArchiveBodyState.RETAINED
 
 
 @dataclass(frozen=True)
@@ -373,7 +388,17 @@ def located(
     """
     by_content = _by_content(bodies)
     taken: dict[str, str] = {}
+    numbers: set[str] = set()
     for identity in wanted:
+        number = str(identity.ksef_number)
+        if number in numbers:
+            raise _unusable(
+                f"_metadata.json of export {reference} names invoice "
+                f"{short_reference(number)} twice. One KSeF number cannot "
+                f"identify two documents.",
+                diagnostic=f"Export {reference}: duplicate KSeF number {number}.",
+            )
+        numbers.add(number)
         entry = _entry_of(
             identity,
             bodies=bodies,
@@ -436,6 +461,7 @@ def _encode_index(
                 "ksef_number": entry.ksef_number,
                 "content_hash": entry.content_hash,
                 "archived_at": entry.archived_at.isoformat(),
+                "body_state": entry.body_state.value,
             }
             for entry in index.entries
         ],
@@ -454,6 +480,8 @@ INDEX_DOCUMENT: Final = JsonDocumentStore(
     ),
 )
 
+LEGACY_INDEX_DOCUMENT: Final = replace(INDEX_DOCUMENT, schema_version=1)
+
 
 def _decode_index(document: dict[str, object]) -> DeduplicationIndex:
     entries: list[dict[str, object]] = document["entries"]  # type: ignore[assignment]
@@ -468,6 +496,11 @@ def _decode_index(document: dict[str, object]) -> DeduplicationIndex:
                 ksef_number=str(entry["ksef_number"]),
                 content_hash=str(entry["content_hash"]),
                 archived_at=datetime.fromisoformat(str(entry["archived_at"])),
+                body_state=(
+                    ArchiveBodyState.LEGACY
+                    if document["schema_version"] == 1
+                    else ArchiveBodyState(str(entry["body_state"]))
+                ),
             )
             for entry in entries
         )
@@ -475,6 +508,10 @@ def _decode_index(document: dict[str, object]) -> DeduplicationIndex:
         raise ArchiveIndexUnreadable(
             f"The deduplication index names one invoice twice: {repeated}"
         ) from repeated
+    except (KeyError, TypeError, ValueError) as malformed:
+        raise ArchiveIndexUnreadable(
+            "The deduplication index has an invalid entry. Refusing to guess its evidence state."
+        ) from malformed
 
 
 @dataclass(frozen=True)
@@ -503,13 +540,16 @@ class InvoiceArchive:
         return self.directory / INDEX_FILE
 
     def load_index(self) -> DeduplicationIndex:
-        document = INDEX_DOCUMENT.load(self.index_path)
+        try:
+            document = INDEX_DOCUMENT.load(self.index_path)
+        except ArchiveIndexUnreadable:
+            document = LEGACY_INDEX_DOCUMENT.load(self.index_path)
         if document is None:
             return DeduplicationIndex()
         return _decode_index(document)
 
     def store(self, *, package: ExportPackage) -> ArchiveReport:
-        """Write every invoice the manifest names, once, and record that it was held.
+        """Verify or repair every retained invoice and preserve retention decisions.
 
         The index is read, extended and written inside one hold on the subject's
         directory (ADR-107 §2). Read outside it, the snapshot went stale the
@@ -520,28 +560,59 @@ class InvoiceArchive:
         """
         wanted = identities(package.metadata)
         bodies = {document.name: document.content for document in package.documents}
+        if len(bodies) != len(package.documents):
+            raise ArchiveMetadataUnusable(
+                "The export contains duplicate document names. Refusing ambiguous evidence."
+            )
         carrying = located(wanted=wanted, bodies=bodies, reference=package.reference)
         with exclusive_write(self.directory, directory_mode=ARCHIVE_DIRECTORY_MODE):
             index = self.load_index()
+            held = {entry.ksef_number: entry for entry in index.entries}
+            # Refuse identity conflicts before changing any body or the index.
+            # A corrupt local file can be repaired; changing the recorded
+            # digest for an immutable KSeF number cannot be called a repair.
+            for number, name in carrying.items():
+                previous = held.get(number)
+                if previous is not None and previous.content_hash != digest_of(bodies[name]):
+                    technical_log().warning("Archive digest conflict for %s.", number)
+                    raise ArchiveEvidenceConflict(
+                        f"Invoice {short_reference(number)} disagrees with its recorded "
+                        f"digest. Refusing to replace evidence for an existing KSeF number."
+                    )
+                if (
+                    previous is not None
+                    and previous.body_state is ArchiveBodyState.LEGACY
+                    and not self._body_path(number).exists()
+                ):
+                    raise ArchiveEvidenceUnavailable(
+                        f"Invoice {short_reference(number)} has no body and its legacy "
+                        f"index records no retention decision. Verify whether it was "
+                        f"purged before restoring it."
+                    )
             archived: list[str] = []
             already_held: list[str] = []
             recorded: list[IndexEntry] = []
             self.invoice_directory.mkdir(mode=ARCHIVE_DIRECTORY_MODE, parents=True, exist_ok=True)
             for identity in wanted:
                 number = str(identity.ksef_number)
-                if number in index.known:
+                previous = held.get(number)
+                if previous is not None and previous.body_state is ArchiveBodyState.REMOVED:
                     already_held.append(number)
                     continue
                 content = bodies[carrying[number]]
                 written = self._written(number=number, content=content)
                 (archived if written else already_held).append(number)
-                recorded.append(
-                    IndexEntry(
-                        ksef_number=number,
-                        content_hash=digest_of(content),
-                        archived_at=self.clock(),
+                if previous is None:
+                    recorded.append(
+                        IndexEntry(
+                            ksef_number=number,
+                            content_hash=digest_of(content),
+                            archived_at=self.clock(),
+                        )
                     )
-                )
+                else:
+                    held[number] = replace(previous, body_state=ArchiveBodyState.RETAINED)
+            index = replace(index, entries=tuple(held.values()))
             self._save_index(index.extended(recorded))
         return ArchiveReport(
             directory=str(self.invoice_directory),
@@ -554,17 +625,50 @@ class InvoiceArchive:
         # The KSeF number is validated as `<NIP>-<date>-<id>-<checksum>`, so it
         # holds neither a separator nor a dot and cannot reach out of the
         # directory or swallow the suffix below.
-        target = self.invoice_directory / f"{number}{INVOICE_SUFFIX}"
-        if target.exists():
-            # Never a silent overwrite (#38). The file name is the identity, so
-            # whatever is already there is this very invoice — it is reported as
-            # already held rather than replaced.
+        target = self._body_path(number)
+        if target.exists() and target.read_bytes() == content:
+            # A path alone is not evidence. Reuse only the bytes verified by
+            # this package; repair corrupt or missing bodies atomically.
             return False
         # The rename is the guardian of the invariant (D-006): a crash mid-write
         # leaves a staging file nobody reads, never half an invoice under a name
         # that claims to be a whole one.
         written_atomically(target, content=content, file_mode=ARCHIVE_FILE_MODE)
         return True
+
+    def _body_path(self, number: str) -> Path:
+        return self.invoice_directory / f"{number}{INVOICE_SUFFIX}"
+
+    def remove_bodies(self, *, numbers: Iterable[str]) -> DeduplicationIndex:
+        """Persist intentional removal before unlinking, under the writer's lock.
+
+        A crash after the index write leaves a removal decision and possibly a
+        body, so retrying deletion is safe. A missing unmarked body is never
+        mistaken for retention on the next export replay.
+        """
+        requested = set(numbers)
+        with exclusive_write(self.directory, directory_mode=ARCHIVE_DIRECTORY_MODE):
+            index = self.load_index()
+            unknown = requested - index.known
+            if unknown:
+                number = sorted(unknown)[0]
+                raise ArchiveEvidenceUnavailable(
+                    f"Invoice {short_reference(number)} has no index entry. "
+                    f"Archive verified evidence before recording its removal."
+                )
+            removed = replace(
+                index,
+                entries=tuple(
+                    replace(entry, body_state=ArchiveBodyState.REMOVED)
+                    if entry.ksef_number in requested
+                    else entry
+                    for entry in index.entries
+                ),
+            )
+            self._save_index(removed)
+            for number in requested:
+                self._body_path(number).unlink(missing_ok=True)
+            return removed
 
     def _save_index(self, index: DeduplicationIndex) -> None:
         document = _encode_index(index, nip=self.nip, environment=self.environment)

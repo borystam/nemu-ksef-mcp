@@ -52,6 +52,9 @@ class SubjectRoleResult(BaseModel):
     archived: list[str]
     already_held: list[str]
     archive_directory: str | None
+    archived_count: int = 0
+    already_held_count: int = 0
+    identifiers_truncated: bool = False
 
 
 class SessionCeilingsResult(BaseModel):
@@ -72,6 +75,23 @@ class SynchronisationResult(ToolResult):
     # Quote this back and the whole pass can be read out of the journal
     # (GH-117). It is the one identifier here that names nobody.
     correlation: str
+
+
+class SubjectRoleStatus(BaseModel):
+    subject_role: str
+    cursor: str | None
+    last_attempt_at: str | None
+    pending: bool
+
+
+class SynchronisationStatus(ToolResult):
+    state: str
+    observed_at: str
+    archived_identity_count: int
+    pending_export_count: int
+    subject_roles: list[SubjectRoleStatus]
+    state_file: str
+    next_action: str
 
 
 class InvoiceRow(BaseModel):

@@ -1,4 +1,4 @@
-"""What a period answered last time, kept so the same question costs nothing.
+"""Recent period answers, reused briefly to conserve metadata queries.
 
 The scarce resource is twenty metadata queries an hour, and the MCP server under
 `uvx` is killed together with the agent session. Without a record on disk, the
@@ -28,7 +28,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Final
@@ -57,6 +57,11 @@ from ksef_mcp.paths import SubjectScope
 PERIOD_DIRECTORY: Final[str] = "periods"
 
 CACHE_FILE_SUFFIX: Final[str] = ".json"
+
+# An issue-date month can gain invoices after it ends. Completeness describes
+# the pages fetched, not an immutable registry snapshot, so even a complete
+# empty month must be queried again after this interval.
+DEFAULT_MAX_AGE: Final[timedelta] = timedelta(minutes=15)
 
 # Raised to 2 when a window's end stopped being nullable (GH-84), to 3 when a
 # page started carrying the offset it came from (GH-182), and to 4 when a row
@@ -292,6 +297,11 @@ class PeriodCache:
     environment: KsefEnvironment
     root: Path | None = None
     clock: Callable[[], datetime] = now_utc
+    max_age: timedelta = DEFAULT_MAX_AGE
+
+    def __post_init__(self) -> None:
+        if self.max_age < timedelta(0):
+            raise ValueError("The period cache maximum age must not be negative.")
 
     @property
     def directory(self) -> Path:
@@ -313,7 +323,13 @@ class PeriodCache:
             document = CACHE_DOCUMENT.load(path)
             if document is None:
                 return None
-            return _decode(document)
+            remembered = _decode(document)
+            age = self.clock() - remembered.queried_at
+            # A clock rollback or future timestamp cannot establish freshness.
+            # Zero disables reuse; the exact expiry boundary is already stale.
+            if not timedelta(0) <= age < self.max_age:
+                return None
+            return remembered
         except (OSError, ValueError, KeyError, TypeError):
             # A miss, never an error. This root is reconstructible by
             # construction, and refusing to answer because a cleaner truncated a
@@ -338,11 +354,9 @@ class PeriodCache:
         The entry comes back either way, because the caller needs that moment to
         report; an open window simply leaves nothing behind for the next run.
 
-        An incomplete page is not written. Nothing here expires, so remembering
-        a window the allowance could not finish would freeze the part that fit
-        as the answer forever — and the call that could finish it, an hour later
-        with the allowance restored, would be served the stump from disk instead
-        (GH-182).
+        An incomplete page is not written, so the next call can finish the
+        window as soon as its allowance permits, without waiting for the cache
+        to expire (GH-182).
         """
         entry = CachedPeriod(
             period=period,
@@ -364,10 +378,10 @@ class PeriodCache:
 
 @dataclass(frozen=True)
 class PeriodMetadataReader:
-    """Asks KSeF for a period once, and answers every repeat of it from disk.
+    """Reuse recent answers; query KSeF after expiry or an explicit refresh.
 
-    The budget is spent on the miss and only on the miss — that is the whole
-    decision D-021 makes, expressed as the one place the allowance is touched.
+    Expired answers never stand in for a blocked query: allowance and registry
+    failures propagate, so an old complete page cannot imply current coverage.
     """
 
     cache: PeriodCache
@@ -379,8 +393,11 @@ class PeriodMetadataReader:
         session: KsefSession,
         period: Period,
         subject_role: SubjectRole,
+        refresh: bool = False,
     ) -> PeriodAnswer:
-        remembered = self.cache.remembered(period=period, subject_role=subject_role)
+        remembered = (
+            None if refresh else self.cache.remembered(period=period, subject_role=subject_role)
+        )
         if remembered is not None:
             return PeriodAnswer(
                 page=remembered.page,

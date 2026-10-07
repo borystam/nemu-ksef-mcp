@@ -9,11 +9,12 @@ is what makes them testable by equality rather than by capturing output.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 from ksef_mcp import config, keyring_preflight
 from ksef_mcp.config import Configuration
-from ksef_mcp.metadata import DISTRIBUTION_NAME, SERVER_NAME, VERSION
+from ksef_mcp.metadata import DISTRIBUTION_NAME, SERVER_COMMAND, SERVER_NAME, VERSION
 from ksef_mcp.rendering import node_preflight
 from ksef_mcp.retention import PurgePlan, PurgeWindow
 from ksef_mcp.storage import token_store
@@ -105,7 +106,7 @@ def describe_identity(executable: str | None) -> tuple[str, ...]:
     `verify` costs a KSeF call to answer the same question.
     """
     return (
-        f"  Dystrybucja: {DISTRIBUTION_NAME} {VERSION} (Dev10x.Guru, lokalny)",
+        f"  Dystrybucja: {DISTRIBUTION_NAME} {VERSION} (Nemu, fork Dev10x.Guru, lokalny)",
         f"  Ścieżka: {'nie znaleziono w PATH' if executable is None else executable}",
         "  To nie jest ksef-mcp.pl — tamten projekt jest niepowiązany i zdalny.",
     )
@@ -299,8 +300,8 @@ def describe_manual_registration(command: str) -> tuple[str, ...]:
         "  Albo dopisz do konfiguracji klienta (Claude Desktop, Cursor):",
         '    "mcpServers": {',
         f'      "{SERVER_NAME}": {{',
-        '        "command": "uvx",',
-        f'        "args": ["{SERVER_NAME}"]',
+        f'        "command": {json.dumps(SERVER_COMMAND[0])},',
+        f'        "args": {json.dumps(SERVER_COMMAND[1:])}',
         "      }",
         "    }",
     )

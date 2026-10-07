@@ -416,7 +416,11 @@ class Ksef2Session:
                 f"with {status}. A package link expires."
             ) from error
         except httpx.HTTPError as error:
-            raise KsefUnreachable(f"Could not reach package storage: {error}") from error
+            # Transport messages can contain the presigned bearer URL. Only
+            # the failure type may travel to the MCP client and its logs.
+            raise KsefUnreachable(
+                f"Could not reach package storage: {type(error).__name__}"
+            ) from error
         return response.content
 
     def download_invoice(self, *, ksef_number: KsefNumber) -> bytes:

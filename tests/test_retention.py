@@ -7,7 +7,7 @@ directly — it deletes, runs the archiving path again, and looks whether
 anything that just disappeared lands back on disk.
 
 The rest of the assertion families: both cutting dimensions (subject and
-period), the untouchability of neighbouring files (the index, continuation
+period), the untouchability of neighbouring files (continuation
 points, the review log), and the fact that an irreversible operation never
 guesses — a file whose name is not a KSeF number stays exactly where it
 lies.
@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from ksef_mcp.durability import WriteExclusivityUnavailable, exclusive_write
 from ksef_mcp.ksef_port.types import ExportPackage, KsefEnvironment, PackageDocument
 from ksef_mcp.retention import (
     ArchivePurge,
@@ -28,8 +29,9 @@ from ksef_mcp.retention import (
     PurgeWindowInverted,
     purge_entry,
 )
-from ksef_mcp.storage.archive import InvoiceArchive
+from ksef_mcp.storage.archive import ArchiveBodyState, ArchiveEvidenceUnavailable, InvoiceArchive
 from ksef_mcp.storage.audit import AuditedOperation, Authorisation, AuthorisationBasis, Disclosure
+from tests.conftest import in_another_thread
 from tests.storage.test_archive import a_manifest
 
 NIP = "1234567890"
@@ -228,12 +230,58 @@ def test_the_report_carries_the_criteria_it_was_asked_for(purge: ArchivePurge) -
     assert report.criteria == window.criteria
 
 
-def test_the_deduplication_index_is_never_rewritten(purge: ArchivePurge) -> None:
-    before = purge.archive.index_path.read_bytes()
+def test_removal_is_explicit_without_changing_recorded_identity(purge: ArchivePurge) -> None:
+    before = purge.archive.load_index()
 
     purge.remove(plan=purge.plan(window=PurgeWindow()))
 
-    assert purge.archive.index_path.read_bytes() == before
+    after = purge.archive.load_index()
+    assert all(entry.body_state is ArchiveBodyState.REMOVED for entry in after.entries)
+    assert [
+        (entry.ksef_number, entry.content_hash, entry.archived_at) for entry in after.entries
+    ] == [(entry.ksef_number, entry.content_hash, entry.archived_at) for entry in before.entries]
+
+
+def test_unindexed_evidence_is_not_deleted_without_a_retention_record(purge: ArchivePurge) -> None:
+    purge.archive.index_path.unlink()
+    plan = purge.plan(window=PurgeWindow())
+
+    with pytest.raises(ArchiveEvidenceUnavailable, match="no index entry"):
+        purge.remove(plan=plan)
+
+    assert all(candidate.path.exists() for candidate in plan.candidates)
+
+
+def test_retention_does_not_race_with_a_running_archive_writer(purge: ArchivePurge) -> None:
+    plan = purge.plan(window=PurgeWindow())
+    with exclusive_write(purge.archive.directory, directory_mode=0o700):
+        with pytest.raises(WriteExclusivityUnavailable):
+            in_another_thread(lambda: purge.remove(plan=plan))
+
+    assert all(candidate.path.exists() for candidate in plan.candidates)
+
+
+def test_an_interrupted_purge_can_be_replayed_without_resurrecting_bodies(
+    purge: ArchivePurge, package: ExportPackage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = purge.plan(window=PurgeWindow())
+    original_unlink = Path.unlink
+
+    def fail_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        raise OSError("simulated interrupted removal")
+
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    with pytest.raises(OSError, match="interrupted removal"):
+        purge.remove(plan=plan)
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    assert all(
+        entry.body_state is ArchiveBodyState.REMOVED for entry in purge.archive.load_index().entries
+    )
+
+    purge.remove(plan=plan)
+    purge.remove(plan=plan)
+    assert purge.archive.store(package=package).archived == ()
+    assert all(not candidate.path.exists() for candidate in plan.candidates)
 
 
 def test_a_purged_invoice_is_never_fetched_again(
