@@ -59,8 +59,10 @@ known vulnerabilities in the locked dependency set after PyJWT was updated to
 wheel installation can resolve newer compatible transitive dependencies than
 the development lock; its smoke test has a narrower scope than the locked suite.
 
-GitHub CI repeats tests, checks, dependency auditing, build and installed-wheel
-stdio on Linux. Consult the release commit's Actions result for remote status.
+GitHub CI passed tests, checks, dependency auditing, build and installed-wheel
+stdio on Linux for implementation commit `5e189af13bcce563ae7be333a5df44d1c19fa27c`:
+[CI run](https://github.com/borystam/nemu-ksef-mcp/actions/runs/37614401617).
+The subsequent release-status update changes documentation only.
 
 ## Not established
 

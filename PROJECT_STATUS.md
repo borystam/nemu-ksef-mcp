@@ -47,5 +47,11 @@ formatting and three import contracts pass. Locked dependency audit reports no
 known vulnerabilities. Rebuilt wheel installed separately; real stdio discovery
 and server_info pass for seven tools. No account credentials or documents used.
 
-Public fork created at https://github.com/borystam/nemu-ksef-mcp. Next action is
-push the tested commit, check Linux CI, and publish the documented alpha tag.
+Public fork: https://github.com/borystam/nemu-ksef-mcp. The implementation is
+pushed. Linux CI passed tests, lint, dependency audit, build and installed-wheel
+stdio on implementation commit 5e189af13bcce563ae7be333a5df44d1c19fa27c:
+https://github.com/borystam/nemu-ksef-mcp/actions/runs/37614401617
+
+Release packaging: nemu-v0.1.0, AGPL-3.0-only, source and wheel. This final status
+update changes documentation only. The next product milestone is an explicitly
+bounded TEST/account pilot; no service connection or financial close was performed.
