@@ -15,18 +15,40 @@ This is an **AGPL-3.0-only fork** of
 collection engine, SDK adapter, archive, rate budgets, renderer and much of the
 test suite. [Attribution and changes](NOTICE.md).
 
-## What this fork changes
+## Why choose Nemu?
 
-- Accepted export references and encryption keys are saved **before** polling.
-  Restart resumes the same export after a polling failure.
+Choose Nemu when you want **a local invoice archive your agent can use for
+reconciliation**, with collection and recovery handled by the service. The agent
+requests a sync and reads the outcome; it does not have to implement API paging,
+export decryption or retry budgets. That is particularly useful when designing
+for smaller, self-hosted models, although we have not yet evaluated one with Nemu.
+
+Our review found concrete collection problems in other implementations. These
+are comparisons with **specific audited revisions**, not claims about every
+version or a ranking of all KSeF MCPs:
+
+| Problem in the reviewed implementation | Nemu's behavior | Practical benefit |
+|---|---|---|
+| Ksefnik advanced by the page size instead of the page index; mcp-ksef-pl search returned only the first page. | The inherited Dev10x engine handles metadata pagination and export continuation inside the service. | The agent does not need to discover and repair a paging algorithm. |
+| Dev10x could lose a newly accepted export's reference and key when its first status poll failed. | **Added:** persist the accepted reference, key and attempt time before polling; restart resumes that export. | Recover from a polling failure without starting the accepted export again. |
+| Dev10x could keep a finished month's cached result indefinitely after late invoices arrived. | **Added:** 15-minute cache expiry; failed refresh is reported without silently serving the expired result. | Repeated month reviews can discover late invoices and expose refresh failures. |
+| Dev10x could trust an existing XML filename despite damaged contents. | **Added:** verify retained bytes on replay and repair from verified export content, respecting intentional deletion records. | Replayed evidence is checked against what is actually stored. |
+| p-zmud's metadata output clipped a 100-row page to 50, with no way to retrieve the omitted half from that result. | **Added to our sync replies:** exact counts and at most 50 IDs per list/role; full collected evidence remains in the archive and audit trail. | Compact agent responses do not discard collected invoices. |
+
+See the [dated comparison and evidence](docs/COMPARISON.md) for pinned source
+links, test locations and limitations. The pagination/export engine, original XML
+preservation, Decimal amounts and currency grouping are **upstream strengths**;
+we built on them rather than recreating them.
+
+Nemu is focused on read-only collection over local stdio. If you need invoice
+issuance, remote HTTP/OAuth hosting or built-in bank matching, evaluate tools
+designed for those workflows. We have not established better performance, live
+account completeness or greater overall security than other projects.
+
+## Other additions in this fork
+
 - First-run historical backfill accepts an explicit start timestamp; individual
   export windows and request budgets remain controlled by the service.
-- Monthly metadata caches expire after 15 minutes. An expired query that cannot
-  refresh fails visibly instead of silently reusing a stale complete result.
-- Archive replay verifies retained bytes and repairs damage from verified export
-  content. Explicit deletion records preserve intentional retention decisions.
-- Sync replies contain exact counts and at most 50 identifiers per list/role.
-  Full evidence remains in the local archive and audit trail.
 - Local `synchronisation_status` works without a token or registry request.
 - Spreadsheet exports neutralize formula-leading counterparty text; package
   errors omit signed download URLs; the locked PyJWT dependency is updated.
